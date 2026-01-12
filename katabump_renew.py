@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-KataBump 自动续订/提醒脚本 - 最终修正版
-基于用户登录成功版优化：增强日期抓取 + 强制续订触发
-"""
 
 import os
 import sys
@@ -13,13 +9,14 @@ from datetime import datetime, timezone, timedelta
 
 # 配置
 DASHBOARD_URL = 'https://dashboard.katabump.com'
+# 建议在 GitHub Secrets 中设置，代码里保留一个默认值
 SERVER_ID = os.environ.get('KATA_SERVER_ID', '201692')
 KATA_EMAIL = os.environ.get('KATA_EMAIL', '')
 KATA_PASSWORD = os.environ.get('KATA_PASSWORD', '')
 TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN', '')
-TG_CHAT_ID = os.environ.get('TG_USER_ID', '') # 请确保 GitHub Secret 名为 TG_USER_ID
+TG_CHAT_ID = os.environ.get('TG_USER_ID', '') 
 
-# 执行器配置
+# 执行器名称
 EXECUTOR_NAME = os.environ.get('EXECUTOR_NAME', 'GitHub Actions')
 
 def log(msg):
@@ -44,9 +41,10 @@ def send_telegram(message):
     return False
 
 def get_expiry(html):
-    # 修正：更强大的日期抓取正则，防止返回 None
+    # 增强版正则：依次尝试 1.Expiry标签后 2.Input框value里 3.页面任何日期格式
     patterns = [
-        r'Expiry[\s\S]*?(\d{4}-\d{2}-\d{2})',
+        r'Expiry[\s\S]*?>\s*(\d{4}-\d{2}-\d{2})',
+        r'value=["\'](\d{4}-\d{2}-\d{2})["\']',
         r'(\d{4}-\d{2}-\d{2})'
     ]
     for p in patterns:
@@ -56,18 +54,17 @@ def get_expiry(html):
 
 def get_csrf(html):
     patterns = [
-        r'<input[^>]*name=["\']csrf["\'][^>]*value=["\']([^"\']+)["\']',
-        r'<input[^>]*value=["\']([^"\']+)["\'][^>]*name=["\']csrf["\']',
+        r'name=["\']csrf["\'][^>]*value=["\']([^"\']+)["\']',
+        r'value=["\']([^"\']+)["\'][^>]*name=["\']csrf["\']',
     ]
     for p in patterns:
         m = re.search(p, html, re.IGNORECASE)
-        if m and len(m.group(1)) > 10:
-            return m.group(1)
+        if m: return m.group(1)
     return None
 
 def days_until(date_str):
     try:
-        if not date_str or date_str == '未知': return None
+        if not date_str: return None
         exp = datetime.strptime(date_str, '%Y-%m-%d')
         today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
         return (exp - today).days
@@ -77,7 +74,6 @@ def days_until(date_str):
 def run():
     log(f'🚀 开始执行 - 服务器 ID: {SERVER_ID}')
     session = requests.Session()
-    # 保留你原本成功的 Headers
     session.headers.update({
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -85,60 +81,64 @@ def run():
     })
     
     try:
-        # ========== 1. 登录 (保留原逻辑) ==========
+        # 1. 登录
         log('🔐 登录中...')
         session.get(f'{DASHBOARD_URL}/auth/login', timeout=30)
         login_resp = session.post(
             f'{DASHBOARD_URL}/auth/login',
             data={'email': KATA_EMAIL, 'password': KATA_PASSWORD, 'remember': 'true'},
             headers={'Content-Type': 'application/x-www-form-urlencoded', 'Referer': f'{DASHBOARD_URL}/auth/login'},
-            timeout=30, allow_redirects=True
+            timeout=30
         )
-        if '/auth/login' in login_resp.url: raise Exception('登录失败')
+        if '/auth/login' in login_resp.url: raise Exception('登录失败，请检查账号密码')
         log('✅ 登录成功')
         
-        # ========== 2. 获取服务器信息 ==========
+        # 2. 访问管理页
         server_page = session.get(f'{DASHBOARD_URL}/servers/edit?id={SERVER_ID}', timeout=30)
-        expiry = get_expiry(server_page.text) or '未知'
+        expiry = get_expiry(server_page.text)
         days = days_until(expiry)
         csrf = get_csrf(server_page.text)
-        log(f'📅 到期: {expiry} (剩余 {days if days is not None else "未知"} 天)')
+        log(f'📅 抓取到期日期: {expiry or "未知"} (剩余 {days if days is not None else "未知"} 天)')
         
-        # ========== 3. 尝试续订 ==========
-        # 修正：即使日期是未知，或者剩余天数小于等于 2 天，都强制尝试
+        # 3. 尝试续订 (无论日期是否已知，只要没到期很远就点一下)
         if days is None or days <= 2:
-            log('🔄 满足触发条件，正在发送 API 续订请求...')
+            log('🔄 满足触发条件或日期未知，发送续订请求...')
+            # 必须设置 allow_redirects=False 来捕捉 302 跳转
             api_resp = session.post(
                 f'{DASHBOARD_URL}/api-client/renew?id={SERVER_ID}',
                 data={'csrf': csrf} if csrf else {},
                 headers={'Referer': f'{DASHBOARD_URL}/servers/edit?id={SERVER_ID}'},
-                timeout=30, allow_redirects=False # 重要：禁止自动重定向以便抓取 Location
+                timeout=30,
+                allow_redirects=False 
             )
             
-            # 判定跳转结果
-            if api_resp.status_code == 302:
-                location = api_resp.headers.get('Location', '')
-                if 'renew=success' in location:
-                    log('🎉 自动续订成功！')
-                    send_telegram(f'✅ <b>KataBump 续订成功</b>\n服务器: <code>{SERVER_ID}</code>\n新日期: {expiry}(已刷新)')
-                elif 'error=captcha' in location:
-                    log('❌ 触发验证码')
-                    send_telegram(f'⚠️ <b>需要手动验证</b>\n服务器: {SERVER_ID}\n原因: 触发了人机验证，请手动登录操作。')
-                else:
-                    log(f'ℹ️ 接口反馈: {location.split("/")[-1]}')
+            # 判定结果
+            status = api_resp.status_code
+            location = api_resp.headers.get('Location', '')
+            log(f'📥 API 响应码: {status}, 跳转位置: {location}')
+            
+            if 'renew=success' in location:
+                log('🎉 自动续订成功！')
+                send_telegram(f'✅ <b>KataBump 续订成功</b>\n服务器: {SERVER_ID}\n新日期: {expiry or "已更新"}')
+            elif 'error=captcha' in location:
+                log('❌ 需要验证码')
+                send_telegram(f'⚠️ <b>需要手动验证</b>\n服务器: {SERVER_ID}\n原因: 触发了人机验证。')
+            elif status == 400:
+                log('⏳ 接口返回 400 (可能未到续订时间)')
             else:
-                log(f'📥 响应码 {api_resp.status_code}，目前可能无需续订。')
+                log('ℹ️ 请求已发送，但未触发成功跳转。')
+        else:
+            log('😴 剩余天数充足，无需续订。')
 
     except Exception as e:
         log(f'❌ 错误: {e}')
-        send_telegram(f'❌ <b>KataBump 脚本报错</b>\n服务器: {SERVER_ID}\n错误: {e}')
+        send_telegram(f'❌ <b>KataBump 脚本异常</b>\n错误: {e}')
 
 def main():
-    # 满足你的需求：启动就发通知
-    send_telegram("🚀 <b>KataBump 保活脚本开始工作</b>")
+    # 启动时简单打个招呼，确认脚本在跑
     log('=' * 50)
     if not KATA_EMAIL or not KATA_PASSWORD:
-        log('❌ 缺失 KATA_EMAIL 或 KATA_PASSWORD')
+        log('❌ 缺少账号密码环境变量')
         return
     run()
     log('🏁 任务完成')
